@@ -1,0 +1,544 @@
+/*
+  This code is used for the joystick controls
+  Used an Arduino Mini
+  
+  Note to self.
+  - Must upload on laptop as PC does not detect arduino mini for some reason.
+
+
+*/
+#include <Arduino.h>
+
+#include <avr/io.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+#include <math.h>
+
+
+// --- for the arduino LCD --- //
+#include <Wire.h>
+
+#include <LiquidCrystal.h> //used for LCD shield.
+LiquidCrystal lcd(8, 9, 4, 5, 6, 7); //E = 8, RS = 9, DDRD = 4, DDRD = 5, DDRD = 6, DDRD = 7.
+
+
+// --- Setting up the ADC --- // --- Analog to Digital Converter --- // --- Code was made to replace analogRead function --- //
+// --- Used to define the ADC pin inputs --- //
+#define adcpin0 13 
+#define adcpin1 80
+#define adcpin2 14
+#define adcpin3 81
+#define adcpin4 82
+#define adcpin5 83
+
+// --- Used to state whether or not to start ADC conversion --- //
+#define Enable 15
+#define Disable 16
+
+
+void ADC_pinSelect(int ADC_pin)
+{
+  switch (ADC_pin)
+  {
+  case adcpin0:
+    ADMUX &= ~(1 << MUX0) & ~(1 << MUX2) & ~(1 << MUX3) & ~(1 << MUX1); // Analog Pin 0 (A0) as input for the potentiometer 
+    break;
+  
+  case adcpin1:
+    ADMUX &= ~(1 << MUX2) & ~(1 << MUX3) & ~(1 << MUX1); // Analog Pin 0 (A0) as input for the potentiometer 
+    ADMUX|= (1 << MUX0);
+    break;
+
+  case adcpin2:
+    ADMUX &= ~(1 << MUX0) & ~(1 << MUX2) & ~(1 << MUX3); // Analog Pin 2 (A2) as input for the potentiometer
+    ADMUX |= (1 << MUX1); //Enable this for Analog Pin 2 (A2)    
+    break;
+
+  case adcpin3:
+    ADMUX &= ~(1 << MUX2) & ~(1 << MUX3); // Analog Pin 0 (A0) as input for the potentiometer 
+    ADMUX|= (1 << MUX0) | (1 << MUX1) ;
+    break;
+
+  case adcpin4:
+    ADMUX &= ~(1 << MUX0) & ~(1 << MUX1) & ~(1 << MUX3); // Analog Pin 0 (A0) as input for the potentiometer 
+    ADMUX|= (1 << MUX2);
+    break;
+
+  case adcpin5:
+    ADMUX &= ~(1 << MUX1) & ~(1 << MUX3); // Analog Pin 0 (A0) as input for the potentiometer 
+    ADMUX|= (1 << MUX0) | (1 << MUX2);
+    break;
+
+  }
+  
+}
+
+void ADC_Status(int EnableADC)
+{
+  switch (EnableADC)
+  {
+  case Enable:
+    ADCSRA |= 1 << ADEN; // Enable ADC 
+    break;
+
+  case Disable:
+    ADCSRA &= ~(1 << ADEN); // Disable ADC 
+    //ADCSRA &= ~(1 << ADSC); // Stop Conversion 
+    break;
+
+  }
+}
+
+int ReadAnalogVal(int pin, int conv)
+{
+  ADMUX |= 1 << REFS0;
+  ADMUX &= ~(1 << REFS1); // Set reference voltage to be the capacitors
+  ADC_pinSelect(pin);
+  ADCSRA |= (1 << ADPS0) | (1 << ADPS1) | (1 << ADPS2); // 128 prescaler, for a smoother and clearer resolution
+  //ADCSRA |= 1 << ADEN; // Enable everything 
+  ADC_Status(conv); // Used to enable or disable the ADC
+
+  ADCSRA |= 1 << ADSC; // Start Conversion
+  while(ADCSRA & (1 << ADSC)); // wait until the conversion has finished, compares values
+  //long int adc_value = ADC; // adc value only ranges from 0 - 1023, as it is only a 10 bit register  
+
+  long int val = ADC;
+  return val;
+}
+
+// --- Mapping Function --- // --- x is the input --- //
+float map(float x, float in_min, float in_max, float out_min, float out_max)
+{
+  // --- This function was used to map two different sets of linear values ---//
+  // --- Used in the stepper motor --- // --- Allowed for the conversion of angle to steps and steps to angle --- // 
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+  
+}
+
+
+// --- For USART Communications --- //
+#define USART_BAUDRATE 9600 // Desired Baud Rate
+#define BAUD_PRESCALER (((F_CPU / (USART_BAUDRATE * 16UL))) - 1)
+
+#define ASYNCHRONOUS (0<<UMSEL00) // USART Mode Selection
+
+#define DISABLED    (0<<UPM00)
+#define EVEN_PARITY (2<<UPM00)
+#define ODD_PARITY  (3<<UPM00)
+#define PARITY_MODE  DISABLED // USART Parity Bit Selection
+
+#define ONE_BIT (0<<USBS0)
+#define TWO_BIT (1<<USBS0)
+#define STOP_BIT ONE_BIT      // USART Stop Bit Selection
+
+#define FIVE_BIT  (0<<UCSZ00)
+#define SIX_BIT   (1<<UCSZ00)
+#define SEVEN_BIT (2<<UCSZ00)
+#define EIGHT_BIT (3<<UCSZ00)
+#define DATA_BIT   EIGHT_BIT  // USART Data Bit Selection
+
+#define RX_COMPLETE_INTERRUPT         (1<<RXCIE0)
+#define DATA_REGISTER_EMPTY_INTERRUPT (1<<UDRIE0)
+
+volatile uint8_t USART_TransmitBuffer; // Global Buffer
+volatile uint8_t USART_ReceiveBuffer; // Global Buffer
+
+
+void USART_Init()
+{
+  // Set Baud Rate
+  UBRR0H = BAUD_PRESCALER >> 8;
+  UBRR0L = BAUD_PRESCALER;
+  
+  // Set Frame Format
+  UCSR0C = ASYNCHRONOUS | PARITY_MODE | STOP_BIT | DATA_BIT;
+  
+  // Enable Receiver and Transmitter
+  UCSR0B = (1<<RXEN0) | (1<<TXEN0);
+  
+  //Enable Global Interrupts
+  sei();
+}
+
+
+uint8_t   Ones_Position = 0;    // 8 bit variables to be send using usart
+uint8_t   Tens_Position = 0;
+uint8_t   Hundreths_Position = 0;
+uint8_t   Thousands_Position = 0;
+char   direction = 'N';
+
+//for transmit interrupts
+void USART_TransmitInterrupt(int value, char indication) //reverse this when recieving
+{
+  //Problem with this is it stops running the main code as it is constantly obtaining values. Not the best choice when transmitting.
+  uint16_t  temp = 0; //Temporary Storage (16bit)
+  direction = indication; 
+  temp = value;
+  
+  Ones_Position = temp % 10; // Eg 1023 % 10  -> Remainder -> 3
+  temp = temp/10;                 // Eg temp = 1023/10 ->102 
+  Tens_Position = temp % 10; // Eg 102  % 10  -> Remainder -> 2
+  temp = temp/10;                 // Eg temp = 102/10 ->10 
+  Hundreths_Position = temp % 10;  // Eg 10   % 10  -> Remainder -> 0
+  Thousands_Position = temp / 10;  // Eg 10   / 10  -> Quotient  -> 1
+  
+  //ASCII Conversion
+  Ones_Position += 0x30;
+  Tens_Position += 0x30;
+  Hundreths_Position += 0x30;
+  Thousands_Position += 0x30;
+  
+  UCSR0B |= DATA_REGISTER_EMPTY_INTERRUPT; // Enables the Interrupt
+}
+
+// --- Code below is for transmitter ---//
+// ISR(USART_UDRE_vect)
+// {
+
+//   while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+//   UDR0 = direction;     // Put data into buffer, sends the data
+
+//   while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+//   UDR0 = '\n'; 
+
+//   //while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+//   //UDR0 = Thousands_Position;    // Put data into buffer, sends the data
+  
+//   while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+//   UDR0 = Hundreths_Position;    // Put data into buffer, sends the data
+  
+  
+//   while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer  
+//   UDR0 = Tens_Position;     // Put data into buffer, sends the data
+  
+//   while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+//   UDR0 = Ones_Position;     // Put data into buffer, sends the data
+
+//   // Send '-' Character //
+//   while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+//   UDR0 = '\n'; 
+
+//   _delay_ms(1000);
+
+//  //UDR0 = USART_TransmitBuffer;
+//  //UCSR0B &= ~DATA_REGISTER_EMPTY_INTERRUPT; // Disables the Interrupt, uncomment for one time transmission of data
+// }
+
+
+//for transmit polling
+void USART_TransmitPolling(uint8_t DataByte)
+{
+  while (( UCSR0A & (1<<UDRE0)) == 0) {}; // Do nothing until UDR is ready
+  UDR0 = DataByte;
+}
+
+void USART_TransmitPolling_Value(int value, char indication) //This can probably be used for the interrupts
+{
+  uint16_t  temp = 0; //Temporary Storage (16bit)
+  direction = indication;
+  temp = value;
+  
+  Ones_Position      = temp % 10; // Eg 1023 % 10  -> Remainder -> 3
+  temp = temp/10;                 // Eg temp = 1023/10 ->102 
+  Tens_Position      = temp % 10; // Eg 102  % 10  -> Remainder -> 2
+  temp = temp/10;                 // Eg temp = 102/10 ->10 
+  Hundreths_Position = temp % 10;  // Eg 10   % 10  -> Remainder -> 0
+  Thousands_Position = temp / 10;  // Eg 10   / 10  -> Quotient  -> 1
+  
+  //ASCII Conversion
+  Ones_Position += 0x30;
+  Tens_Position += 0x30;
+  Hundreths_Position += 0x30;
+  Thousands_Position += 0x30;
+  
+  //Transmitting Direction
+  while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+  UDR0 = direction;    // Put data into buffer, sends the data
+
+  while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+  UDR0 = '\n';  
+
+  //Sending the 4 digit number to PC using USART
+  //while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+  //UDR0 = Thousands_Position;     // Put data into buffer, sends the data
+  
+  while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+  UDR0 = Hundreths_Position;     // Put data into buffer, sends the data
+  
+  
+  while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer  
+  UDR0 = Tens_Position;    // Put data into buffer, sends the data
+  
+  while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+  UDR0 = Ones_Position;    // Put data into buffer, sends the data
+
+  // Send '-' Character //
+  while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+  UDR0 = '\n';  
+
+  _delay_ms(1000);
+}
+
+
+
+// --- Defining the joystick --- //
+float joy_x;
+float joy_y;
+int duty_cycle_val = 50;
+
+float valueREADING_x1;
+float valueREADING_y1;
+
+float valueREADING_x2;
+float valueREADING_y2;
+
+void pin_setup()
+{
+  //DDRB |= (1 << PB2); //pin10, OC1B, Used for PWM
+  DDRB |= (1 << PB1); //pin9
+  DDRB |= (1 << PB0); //pin8
+
+  DDRD |= (1 << PD7); //pin7
+  //DDRD |= (1 << PD6); //pin6, OC0A, Used for PWM
+  DDRD |= (1 << PD5); //pin5
+}
+
+void PWM_Setup() //Uses timer1, outputs pin10 and pin9
+{
+  //DDRB |= (1 << PB1); //pin9, OC1A
+  DDRB |= (1 << PB2); //pin10, OC1B
+  //DDRD |= (1 << PD6);
+  /*
+    We must set the fequency of the PWM Based on the prescalar. Refer to the discord 
+
+  */
+  //Manually set up each pin
+  TCCR1A |= (1 << COM1B1);// | (1 << COM1B0);
+  TCCR1A |= (1 << WGM12) | (1 << WGM10);
+  TCCR1B |= (1 << CS11) | (1 << CS10);
+
+  //these must vary with the joystick
+  //OCR1A = ((256 * duty_cycle) / 100) - 1; //pin9
+  //OCR1B = ((256 * 100) / 100) - 1; //pin10
+
+
+
+  
+  DDRD |= (1 << PD6);    //Fast PWM output at OC0A pin
+
+  // We must set the fequency of the PWM Based on the prescalar. Refer to the discord 
+  TCCR0A |= (1 << COM0A1); //set to clear OCR0A on match
+  TCCR0A |= (1 << WGM01) | (1 << WGM00);  //Non-Inverting Fast PWM mode 3 using OCR0A unit
+  TCCR0B |= (1 << CS00);  //No-Prescalar
+  //OCR0A = ((256 * 100) / 100) - 1; //pin6
+}
+
+
+void joystick_inputs() //values are in voltages, find a way to interface it with the button toggle.
+{
+  joy_x = ReadAnalogVal(adcpin1, 15);
+  joy_y = ReadAnalogVal(adcpin2, 15);
+
+  // valueREADING_x2 = map(joy_x, 0, 2.5, 0, duty_cycle_val);
+  // valueREADING_y2 = map(joy_y, 0, 2.5, 0, duty_cycle_val);  
+
+  // valueREADING_x1 = map(joy_x, 2.5, 5, 0, duty_cycle_val); //mapping the right and left turns
+  // valueREADING_y1 = map(joy_y, 2.5, 5, 0, duty_cycle_val); //setting up the duty cycles  
+
+}
+
+
+// --- Move Functionalities --- //
+void right_wheel(int state)
+{
+  if (state == 1) //backwards movement
+  {
+    PORTD |= (1 << PD7);
+    PORTD &= ~(1 << PD5);    
+    //PORTD |= (1 << PD5);    
+  }
+  
+  if (state == 0) //forwards movement
+  {
+    PORTD &= ~(1 << PD7);
+    PORTD |= (1 << PD5); 
+  }
+
+}
+
+void left_wheel(int state)
+{
+  if (state == 1) //backwards movement
+  {
+    PORTB |= (1 << PB0);
+    PORTB &= ~(1 << PB1);   
+  }
+  
+  if (state == 0) //forwards movement
+  {
+    PORTB &= ~(1 << PB0);
+    PORTB |= (1 << PB1);  
+  }
+  
+  
+}
+
+char direction_indicator;
+void move_forward()
+{
+  direction_indicator = 'F';
+  right_wheel(0);
+  left_wheel(0);
+
+}
+
+void move_backwards()
+{
+  direction_indicator = 'B';
+  right_wheel(1);
+  left_wheel(1);
+}
+
+void turn_right()
+{
+  direction_indicator = 'R';
+  right_wheel(1);
+  left_wheel(0);
+}
+
+void turn_left()
+{
+  direction_indicator = 'L';
+  right_wheel(0);
+  left_wheel(1);
+}
+
+
+int motor_setA = 0;
+int motor_setB = 0;
+void movement_transmit()
+{
+  joy_x = ReadAnalogVal(adcpin1, 15);
+  joy_y = ReadAnalogVal(adcpin2, 15);
+
+  OCR1B = motor_setA;//((256 * 100) / 100) - 1; //pin10
+  OCR0A = motor_setB;//((256 * 100) / 100) - 1; //pin6 
+
+  // --- For movement in the Y direction, backwards and forwards --- //
+  if (joy_y > 550)
+  {
+    move_forward();
+
+    motor_setA = map(joy_y, 550, 1023, 0, 255);
+    motor_setB = map(joy_y, 550, 1023, 0, 255);
+  }
+  
+  else if (joy_y < 470) //moving backwards
+  {
+    move_backwards();
+
+    motor_setA = map(joy_y, 470, 0, 0, 255);
+    motor_setB = map(joy_y, 470, 0, 0, 255);
+  }
+  
+  else
+  {
+    direction_indicator = 'N';
+    motor_setA = 0;
+    motor_setB = 0;
+  }
+
+  // --- For movement in the X direction, left and right --- //
+  if (joy_x < 470) //turning left
+  {
+    turn_left();
+
+    motor_setA = map(joy_x, 470, 0, 0, 255);
+    motor_setB = map(joy_x, 470, 0, 0, 255);
+  }
+
+  else if (joy_x > 550) //turning right
+  {
+    turn_right();
+
+    motor_setA = map(joy_x, 550, 1023, 0, 255);
+    motor_setB = map(joy_x, 550, 1023, 0, 255);
+  }
+
+  if ((motor_setA < 70) || (motor_setB < 70))
+  {
+    motor_setA = 0;
+    motor_setB = 0;
+  
+  }
+}
+
+void movement_recieve()
+{
+
+}
+
+//for recieving interrupts
+ISR(USART_RX_vect)
+{
+  OCR1B = motor_setA;//((256 * 100) / 100) - 1; //pin10
+  OCR0A = motor_setB;//((256 * 100) / 100) - 1; //pin6 
+
+  USART_ReceiveBuffer = UDR0;
+  if (USART_ReceiveBuffer == 'F')
+  {
+    move_forward();
+
+    motor_setA = 200;
+    motor_setB = 200;
+  }
+
+  if (USART_ReceiveBuffer == 'B')
+  {
+    move_backwards();
+
+    motor_setA = 200;
+    motor_setB = 200;
+  }
+
+  if (USART_ReceiveBuffer == 'L')
+  {
+    turn_left();
+    motor_setA = 200;
+    motor_setB = 200;
+  }
+
+  if (USART_ReceiveBuffer == 'R')
+  {
+    turn_right();
+    motor_setA = 200;
+    motor_setB = 200;
+  }
+
+  if (USART_ReceiveBuffer == 'N')
+  {
+    motor_setA = 0;
+    motor_setB = 0;
+  }
+}
+
+
+void setup() 
+{
+  PWM_Setup();
+  pin_setup();
+  USART_Init();
+
+  UCSR0B |= RX_COMPLETE_INTERRUPT;
+}
+
+void loop() 
+{
+  //movement_recieve();
+  //USART_TransmitPolling_Value(motor_setA, direction_indicator);
+
+  USART_TransmitPolling(USART_ReceiveBuffer);
+}
