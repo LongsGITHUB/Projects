@@ -1,0 +1,891 @@
+/* 
+  This code is used to upload to the car
+  Used your standard arduino
+
+  - Used to upload to the controller
+*/
+
+#include <Arduino.h>
+
+#include <avr/io.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+#include <math.h>
+
+
+// --- for the arduino LCD --- //
+#include <Wire.h>
+
+#include <LiquidCrystal.h>
+LiquidCrystal lcd(8, 9, 4, 5, 6, 7); //E = 8, RS = 9, DDRD = 4, DDRD = 5, DDRD = 6, DDRD = 7.
+
+
+// --- Setting up the ADC --- // --- Analog to Digital Converter --- // --- Code was made to replace analogRead function --- //
+// --- Used to define the ADC pin inputs --- //
+#define adcpin0 13 
+#define adcpin1 80
+#define adcpin2 14
+#define adcpin3 81
+#define adcpin4 82
+#define adcpin5 83
+
+// --- Used to state whether or not to start ADC conversion --- //
+#define Enable 15
+#define Disable 16
+
+void ADC_pinSelect(int ADC_pin)
+{
+  switch (ADC_pin)
+  {
+  case adcpin0:
+    ADMUX &= ~(1 << MUX0) & ~(1 << MUX2) & ~(1 << MUX3) & ~(1 << MUX1); // Analog Pin 0 (A0) as input for the potentiometer 
+    break;
+  
+  case adcpin1:
+    ADMUX &= ~(1 << MUX2) & ~(1 << MUX3) & ~(1 << MUX1); // Analog Pin 0 (A0) as input for the potentiometer 
+    ADMUX|= (1 << MUX0);
+    break;
+
+  case adcpin2:
+    ADMUX &= ~(1 << MUX0) & ~(1 << MUX2) & ~(1 << MUX3); // Analog Pin 2 (A2) as input for the potentiometer
+    ADMUX |= (1 << MUX1); //Enable this for Analog Pin 2 (A2)    
+    break;
+
+  case adcpin3:
+    ADMUX &= ~(1 << MUX2) & ~(1 << MUX3); // Analog Pin 0 (A0) as input for the potentiometer 
+    ADMUX|= (1 << MUX0) | (1 << MUX1) ;
+    break;
+
+  case adcpin4:
+    ADMUX &= ~(1 << MUX0) & ~(1 << MUX1) & ~(1 << MUX3); // Analog Pin 0 (A0) as input for the potentiometer 
+    ADMUX|= (1 << MUX2);
+    break;
+
+  case adcpin5:
+    ADMUX &= ~(1 << MUX1) & ~(1 << MUX3); // Analog Pin 0 (A0) as input for the potentiometer 
+    ADMUX|= (1 << MUX0) | (1 << MUX2);
+    break;
+
+  }
+  
+}
+
+void ADC_Status(int EnableADC)
+{
+  switch (EnableADC)
+  {
+  case Enable:
+    ADCSRA |= 1 << ADEN; // Enable ADC 
+    break;
+
+  case Disable:
+    ADCSRA &= ~(1 << ADEN); // Disable ADC 
+    //ADCSRA &= ~(1 << ADSC); // Stop Conversion 
+    break;
+
+  }
+}
+
+int ReadAnalogVal(int pin, int conv)
+{
+  ADMUX |= 1 << REFS0;
+  ADMUX &= ~(1 << REFS1); // Set reference voltage to be the capacitors
+  ADC_pinSelect(pin);
+  ADCSRA |= (1 << ADPS0) | (1 << ADPS1) | (1 << ADPS2); // 128 prescaler, for a smoother and clearer resolution
+  //ADCSRA |= 1 << ADEN; // Enable everything 
+  ADC_Status(conv); // Used to enable or disable the ADC
+
+  ADCSRA |= 1 << ADSC; // Start Conversion
+  while(ADCSRA & (1 << ADSC)); // wait until the conversion has finished, compares values
+  //long int adc_value = ADC; // adc value only ranges from 0 - 1023, as it is only a 10 bit register  
+
+  long int val = ADC;
+  return val;
+}
+
+
+// --- Mapping Function --- // --- x is the input --- //
+float map(float x, float in_min, float in_max, float out_min, float out_max)
+{
+  // --- This function was used to map two different sets of linear values ---//
+  // --- Used in the stepper motor --- // --- Allowed for the conversion of angle to steps and steps to angle --- // 
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+  
+}
+
+// --- For USART Communications --- //
+#define USART_BAUDRATE 9600 // Desired Baud Rate
+#define BAUD_PRESCALER (((F_CPU / (USART_BAUDRATE * 16UL))) - 1)
+
+#define ASYNCHRONOUS (0<<UMSEL00) // USART Mode Selection
+
+#define DISABLED    (0<<UPM00)
+#define EVEN_PARITY (2<<UPM00)
+#define ODD_PARITY  (3<<UPM00)
+#define PARITY_MODE  DISABLED // USART Parity Bit Selection
+
+#define ONE_BIT (0<<USBS0)
+#define TWO_BIT (1<<USBS0)
+#define STOP_BIT ONE_BIT      // USART Stop Bit Selection
+
+#define FIVE_BIT  (0<<UCSZ00)
+#define SIX_BIT   (1<<UCSZ00)
+#define SEVEN_BIT (2<<UCSZ00)
+#define EIGHT_BIT (3<<UCSZ00)
+#define DATA_BIT   EIGHT_BIT  // USART Data Bit Selection
+
+#define RX_COMPLETE_INTERRUPT         (1<<RXCIE0)
+#define DATA_REGISTER_EMPTY_INTERRUPT (1<<UDRIE0)
+
+volatile uint8_t USART_TransmitBuffer; // Global Buffer
+
+void USART_Init()
+{
+	// Set Baud Rate
+	UBRR0H = BAUD_PRESCALER >> 8;
+	UBRR0L = BAUD_PRESCALER;
+	
+	// Set Frame Format
+	UCSR0C = ASYNCHRONOUS | PARITY_MODE | STOP_BIT | DATA_BIT;
+	
+	// Enable Receiver and Transmitter
+	UCSR0B = (1<<RXEN0) | (1<<TXEN0);
+	
+	//Enable Global Interrupts
+	sei();
+}
+
+
+uint8_t   Ones_Position = 0;		// 8 bit variables to be send using usart
+uint8_t   Tens_Position = 0;
+uint8_t   Hundreths_Position = 0;
+uint8_t   Thousands_Position = 0;
+char   direction = 'N';
+
+//for transmit interrupts
+void USART_TransmitInterrupt(int value, char indication) //reverse this when recieving
+{
+  //Problem with this is it stops running the main code as it is constantly obtaining values. Not the best choice when transmitting.
+  uint16_t  temp = 0; //Temporary Storage (16bit)
+  direction = indication; 
+  temp = value;
+  
+  Ones_Position = temp % 10; // Eg 1023 % 10  -> Remainder -> 3
+  temp = temp/10;                 // Eg temp = 1023/10 ->102 
+  Tens_Position = temp % 10; // Eg 102  % 10  -> Remainder -> 2
+  temp = temp/10;                 // Eg temp = 102/10 ->10 
+  Hundreths_Position = temp % 10;  // Eg 10   % 10  -> Remainder -> 0
+  Thousands_Position = temp / 10;  // Eg 10   / 10  -> Quotient  -> 1
+  
+  //ASCII Conversion
+  Ones_Position += 0x30;
+  Tens_Position += 0x30;
+  Hundreths_Position += 0x30;
+  Thousands_Position += 0x30;
+  
+	UCSR0B |= DATA_REGISTER_EMPTY_INTERRUPT; // Enables the Interrupt
+}
+
+ISR(USART_UDRE_vect)
+{
+  while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+  UDR0 = direction;		 // Put data into buffer, sends the data
+
+  while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+  UDR0 = '\n';	
+
+  //while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+  //UDR0 = Thousands_Position;		 // Put data into buffer, sends the data
+  
+  while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+  UDR0 = Hundreths_Position;		 // Put data into buffer, sends the data
+  
+  
+  while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer  
+  UDR0 = Tens_Position;		 // Put data into buffer, sends the data
+  
+  while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+  UDR0 = Ones_Position;		 // Put data into buffer, sends the data
+
+  // Send '-' Character //
+  while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+  UDR0 = '\n';	
+
+  _delay_ms(1000);
+
+	//UDR0 = USART_TransmitBuffer;
+	//UCSR0B &= ~DATA_REGISTER_EMPTY_INTERRUPT; // Disables the Interrupt, uncomment for one time transmission of data
+}
+
+
+//for transmit polling
+void USART_TransmitPolling(uint8_t DataByte)
+{
+	while (( UCSR0A & (1<<UDRE0)) == 0) {}; // Do nothing until UDR is ready
+	UDR0 = DataByte;
+}
+
+void USART_TransmitPolling_Value(int value, char indication) //This can probably be used for the interrupts
+{
+  uint16_t  temp = 0; //Temporary Storage (16bit)
+  direction = indication;
+  temp = value;
+  
+  Ones_Position      = temp % 10; // Eg 1023 % 10  -> Remainder -> 3
+  temp = temp/10;                 // Eg temp = 1023/10 ->102 
+  Tens_Position      = temp % 10; // Eg 102  % 10  -> Remainder -> 2
+  temp = temp/10;                 // Eg temp = 102/10 ->10 
+  Hundreths_Position = temp % 10;  // Eg 10   % 10  -> Remainder -> 0
+  Thousands_Position = temp / 10;  // Eg 10   / 10  -> Quotient  -> 1
+  
+  //ASCII Conversion
+  Ones_Position += 0x30;
+  Tens_Position += 0x30;
+  Hundreths_Position += 0x30;
+  Thousands_Position += 0x30;
+  
+  //Sending the 4 digit number to PC using USART
+  while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+  UDR0 = direction;		 // Put data into buffer, sends the data
+
+  while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+  UDR0 = '\n';	
+
+  //while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+  //UDR0 = Thousands_Position;		 // Put data into buffer, sends the data
+  
+  while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+  UDR0 = Hundreths_Position;		 // Put data into buffer, sends the data
+  
+  
+  while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer  
+  UDR0 = Tens_Position;		 // Put data into buffer, sends the data
+  
+  while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+  UDR0 = Ones_Position;		 // Put data into buffer, sends the data
+
+  // Send '-' Character //
+  while (!( UCSR0A & (1<<UDRE0))); // Wait for empty transmit buffer
+  UDR0 = '\n';	
+
+  _delay_ms(1000);
+}
+
+
+// --- for Button inputs --- //
+#define btnRIGHT 0
+#define btnUP 1
+#define btnDOWN 2
+#define btnLEFT 3
+#define btnSELECT 4
+#define btnNONE 5
+
+int adc_value;
+int lcd_inputs;
+int read_lcd_buttons()
+{
+  adc_value = ReadAnalogVal(adcpin0, Enable);
+  //adc_value = analogRead(A0); // read the value from the sensor 
+  if (adc_value > 1000) return btnNONE; // We make this the 1st option for speed reasons since it will be the most likely result
+  if (adc_value < 50)   return btnRIGHT;  
+  if (adc_value < 250)  return btnUP; 
+  if (adc_value < 450)  return btnDOWN; 
+  if (adc_value < 700)  return btnLEFT; // Changed to 700, Default is 650
+  if (adc_value < 850)  return btnSELECT;   
+  return btnNONE;  // when all others fail, return this...
+}
+
+void button_inputs() 
+{
+  switch(lcd_inputs) 
+  {
+    case btnRIGHT:
+      break;
+
+    case btnLEFT:
+      break;
+      
+    case btnUP:
+      break;
+    
+    case btnDOWN:      
+      break;
+
+    case btnSELECT:
+      break;
+
+    case btnNONE:
+      break;
+  }
+}
+
+
+// --- Setting up the Respective timers --- //
+volatile int button_debounce_sm;
+volatile int button_debounce_cursor_y1;
+volatile int blink_1;
+
+volatile int blink_2;
+volatile int button_debounce_cursor2;
+
+volatile int blink_3;
+volatile int button_debounce_cursor3;
+
+void Timer0_CTC() // Used for clock
+{
+  // --- Setting up the timer0 on CTC mode --- // --- Clear Timer on Compare (CTC) allows for trigger interrupts --- //
+  TCCR0A |= 1 << WGM01; // Call for the Waveform Generation Mode (WGM)
+  TCCR0A &= ~(1 << WGM02); // Turn off WGM for CTC Mode
+  TCCR0B &= ~(1 << WGM02);
+
+  TCCR0B |= 1 << CS00 | 1 << CS01; // Setting up 64 Prescalar
+  TCCR0B &= ~(1 << CS02); 
+
+  OCR0A = 249; // Output compare, the desired number of ticks to reach 1ms (1000 Hz), when the timer reaches 249 or 1ms, the state of the pun changes
+  sei(); // Enalbe global interrupt
+
+
+  //TIMSK0 |= 1 << OCIE0A; // Enables interrupts for timer0_compa_vector
+}
+
+void Timer1_CTC() // Used for Stepper Motor 1ms - done because it produces a clearer resolution
+{
+  // --- Setting up a 1 prescalar (equivalent to none) --- //
+  // --- This is done becaause timer1 is 16 bits and thus every count is exactly 1ms --- // 
+  // --- As a result, there are no 'glitches' in the motor --- //
+  TCCR1A |= 1 << WGM12;
+  TCCR1A &= ~(1 << WGM10) & ~(1 << WGM11) & ~(1 << WGM13);
+
+  TCCR1B |= 1 << CS10; // Setting up 1 Prescalar
+  TCCR1B &= ~(1 << CS11) & ~(1 << CS12);
+
+  OCR1A = 15999;
+
+  //TIMSK1 |= 1 << OCIE1A; //enables the timer1
+}
+
+void Timer2_CTC() // Used for debouncing
+{
+  TCCR2A |= (1 << WGM21);
+  TCCR2A &= ~(1 << WGM20) & ~(1 << WGM22);
+
+  TCCR2B |= (1 << CS22);
+  TCCR2B &= ~(1 << CS21) & ~(1 << CS20); // 64 prescalar
+
+  OCR2A = 249;
+
+  TIMSK2 |= 1 << OCIE2A;
+
+}
+
+
+ISR(TIMER0_COMPA_vect)
+{
+
+
+}
+
+ISR(TIMER1_COMPA_vect)
+{
+  
+
+}
+
+ISR(TIMER2_COMPA_vect)
+{
+  button_debounce_sm++;
+  
+  button_debounce_cursor_y1++;
+  blink_1++;
+
+  blink_2++;
+  button_debounce_cursor2++;
+
+  blink_3++;
+  button_debounce_cursor3++;
+}
+
+void debounce_reset()
+{
+
+}
+
+
+// --- Components that will be used for the statemachine --- //
+volatile int universal_debounce_value = 300;
+
+void start_up()
+{
+  lcd.setCursor(2,0);
+  lcd.print("Press Select");
+
+  lcd.setCursor(4,1);
+  lcd.print("To Start");
+}
+
+int cursor_y1 = 0;
+int blinkstate1 = 0;
+void select_mode()
+{
+  // --- Setting up the Blink Rate --- //
+  if ((blink_1 >= 500) && (blinkstate1 == 0))
+  {
+    lcd.setCursor(3,0);
+    lcd.print("Uno-Shield");
+
+    lcd.setCursor(3,1);
+    lcd.print("Mini Game!");
+
+    blink_1 = 0;
+    blinkstate1 = 1;
+  }
+  
+  if ((blink_1 >= 500) && (blinkstate1 == 1))
+  {
+    lcd.setCursor(0, cursor_y1);
+    lcd.print("                     ");      
+
+
+    blink_1 = 0;
+    blinkstate1 = 0;
+  }
+
+
+  // --- Setting up the button Movements --- //
+  if ((cursor_y1 == 0) && (button_debounce_cursor_y1 >= universal_debounce_value) && ((read_lcd_buttons() == btnDOWN) || (read_lcd_buttons() == btnUP)))
+  {
+    cursor_y1 = 1;
+
+    button_debounce_cursor_y1 = 0;
+  }
+  
+  if ((cursor_y1 == 1) && (button_debounce_cursor_y1 >= universal_debounce_value) && ((read_lcd_buttons() == btnDOWN) || (read_lcd_buttons() == btnUP)))
+  {
+    cursor_y1 = 0;
+
+    button_debounce_cursor_y1 = 0;
+  }
+
+}
+
+int cursor_x2 = 0;
+int cursor_y2 = 0;
+int blinkstate2 = 0;
+void UnoShield()
+{
+  if ((blink_2 >= 500) && (blinkstate2 == 0))
+  {
+    lcd.setCursor(0,0);
+    lcd.print("Manual"); //State 1
+
+    lcd.setCursor(0,1);
+    lcd.print("Automate"); //State 2
+
+    lcd.setCursor(10,0);
+    lcd.print("Home"); //State 3
+
+    lcd.setCursor(10,1);
+    lcd.print("Back"); //State 4
+
+    blink_2 = 0;
+    blinkstate2 = 1;
+  }
+
+  if ((blink_2 >= 500) && (blinkstate2 == 1))
+  {
+    lcd.setCursor(cursor_x2, cursor_y2);
+    lcd.print("        ");      
+
+
+    blink_2 = 0;
+    blinkstate2 = 0;
+  }
+
+
+  if ((cursor_y2 == 0) && (button_debounce_cursor2 >= universal_debounce_value) && ((read_lcd_buttons() == btnDOWN) || (read_lcd_buttons() == btnUP)))
+  {
+    cursor_y2 = 1; 
+
+    button_debounce_cursor2 = 0;
+  }
+  
+  if ((cursor_y2 == 1) && (button_debounce_cursor2 >= universal_debounce_value) && ((read_lcd_buttons() == btnDOWN) || (read_lcd_buttons() == btnUP)))
+  {
+    cursor_y2 = 0; 
+
+    button_debounce_cursor2 = 0;
+  }
+
+  if ((cursor_x2 == 0) && (button_debounce_cursor2 >= universal_debounce_value) && ((read_lcd_buttons() == btnRIGHT) || (read_lcd_buttons() == btnLEFT)))
+  {
+    cursor_x2 = 10; 
+
+    button_debounce_cursor2 = 0;
+  }
+  
+  if ((cursor_x2 == 10) && (button_debounce_cursor2 >= universal_debounce_value) && ((read_lcd_buttons() == btnRIGHT) || (read_lcd_buttons() == btnLEFT)))
+  {
+    cursor_x2 = 0; 
+
+    button_debounce_cursor2 = 0;
+  }
+}
+
+void Joystick()
+{
+  lcd.setCursor(2,0);
+  lcd.print("JoyStick TBC");
+
+  lcd.setCursor(1,1);
+  lcd.print("GO BACK BITCH!");
+
+}
+
+void game()
+{
+  lcd.setCursor(4,0);
+  lcd.print("GAME! TBC");
+
+  lcd.setCursor(1,1);
+  lcd.print("GO BACK BITCH!");
+}
+
+int cursor_x3 = 3;
+int cursor_y3 = 1;
+int blinkstate3 = 0;
+void control_select()
+{
+  if ((blink_3 >= 500) && (blinkstate3 == 0))
+  {
+    lcd.setCursor(2,0);
+    lcd.print("Input Select");
+
+    lcd.setCursor(3,1);
+    lcd.print("Joy");
+
+    lcd.setCursor(10,1);
+    lcd.print("Btn");
+
+    blink_3 = 0;
+    blinkstate3 = 1;
+  }
+
+  if ((blink_3 >= 500) && (blinkstate3 == 1))
+  {
+    lcd.setCursor(cursor_x3, cursor_y3);
+    lcd.print("   ");      
+
+    blink_3 = 0;
+    blinkstate3 = 0;
+  }
+
+  if ((cursor_x3 == 3) && (cursor_y3 == 1) && (button_debounce_cursor3 >= universal_debounce_value) && ((read_lcd_buttons() == btnRIGHT) || (read_lcd_buttons() == btnLEFT)))
+  {
+    cursor_x3 = 10;
+
+    button_debounce_cursor3 = 0;
+  }
+  
+  if ((cursor_x3 == 10) && (cursor_y3 == 1) && (button_debounce_cursor3 >= universal_debounce_value) && ((read_lcd_buttons() == btnRIGHT) || (read_lcd_buttons() == btnLEFT)))
+  {
+    cursor_x3 = 3;
+
+    button_debounce_cursor3 = 0;
+  }
+}
+
+char direction_value = 'N';
+void btn_input()
+{
+  lcd.setCursor(1,0);
+  lcd.print("Manual Control");
+
+  lcd.setCursor(1,1);
+  lcd.print("Beep Beep Beep");
+
+  USART_TransmitPolling(direction_value);
+  if (read_lcd_buttons() == btnUP)
+  {
+    direction_value = 'F';
+
+  }
+  
+  if (read_lcd_buttons() == btnDOWN)
+  {
+    direction_value = 'B';
+
+  }
+  
+  if (read_lcd_buttons() == btnLEFT)
+  {
+    direction_value = 'L';
+
+  }
+
+  if (read_lcd_buttons() == btnRIGHT)
+  {
+    direction_value = 'R';
+
+  }
+
+  if (read_lcd_buttons() == btnNONE)
+  {
+    direction_value = 'N';
+
+  }
+}
+
+
+
+// --- State Machine --- //
+int state = 101;
+int clear = 1; //used to clear the lcd
+
+#define startup 101
+#define selectmode 102
+#define Joy 103
+#define Shield 104
+#define Game 105
+#define Control 106
+
+#define btn_mode 107
+
+
+void state_machine()
+{
+  if (button_debounce_sm >= 350)
+  {
+    switch (state)
+    {
+    case startup: // --- Start Up --- //
+      if ((state == startup) && (clear == 0))
+      {
+        start_up();
+
+        if (read_lcd_buttons() == btnSELECT)
+        {      
+          clear = 1;
+          button_debounce_sm = 0;   
+
+          state = selectmode;
+        }
+      }
+
+      if ((state == startup) && (clear == 1))
+      {
+        lcd.clear();
+        clear = 0;
+        break;
+      }
+      //break;
+
+
+    case selectmode: // --- Select Mode --- //
+      if ((state == selectmode) && (clear == 0))
+      {
+        select_mode();
+
+        if ((read_lcd_buttons() == btnSELECT) && (cursor_y1 == 0)) // Unoshield state
+        {
+          clear = 1;
+          button_debounce_sm = 0;
+          //cursor_y1 = 0;
+
+          state = Shield;
+        }
+
+        if ((read_lcd_buttons() == btnSELECT) && (cursor_y1 == 1)) // Joystick State
+        {
+          clear = 1;
+          button_debounce_sm = 0;
+          //cursor_y1 = 0;
+
+          state = Game;
+        }
+
+      }
+
+      if ((state == selectmode) && (clear == 1))
+      {
+        lcd.clear();
+        clear = 0;
+        break;
+      }
+      //break;
+
+
+    case Game: // --- Start Up --- //
+      if ((state == Game) && (clear == 0))
+      {
+        game();
+
+        if (read_lcd_buttons() == btnSELECT)
+        {      
+          clear = 1;
+          button_debounce_sm = 0;   
+
+          state = selectmode;
+        }
+      }
+      
+      if ((state == Game) && (clear == 1))
+      {
+        lcd.clear();
+        clear = 0;
+        break;
+      }
+      //break;
+
+
+    case Shield: // --- Start Up --- //
+      if ((state == Shield) && (clear == 0))
+      {
+        UnoShield();
+
+        if ((read_lcd_buttons() == btnSELECT) && (cursor_x2 == 0) && (cursor_y2 == 0)) //Manual
+        {      
+          clear = 1;
+          button_debounce_sm = 0;   
+
+          state = Control;
+        }
+
+        if ((read_lcd_buttons() == btnSELECT) && (cursor_x2 == 10) && (cursor_y2 == 1)) //Automate
+        {      
+          clear = 1;
+          button_debounce_sm = 0;   
+
+          state = selectmode;
+        }
+
+        if ((read_lcd_buttons() == btnSELECT) && (cursor_x2 == 10) && (cursor_y2 == 0)) //Home
+        {      
+          clear = 1;
+          button_debounce_sm = 0;   
+
+          state = selectmode;
+        }
+
+        if ((read_lcd_buttons() == btnSELECT) && (cursor_x2 == 10) && (cursor_y2 == 1)) //Manual
+        {      
+          clear = 1;
+          button_debounce_sm = 0;   
+
+          state = selectmode;
+        }
+      }
+
+      if ((state == Shield) && (clear == 1))
+      {
+        lcd.clear();
+        clear = 0;
+        break;
+      }
+      //break;
+    
+    
+     case Control: // --- Start Up --- //
+      if ((state == Control) && (clear == 0))
+      {
+        control_select();
+
+        if ((cursor_x3 == 3) && (read_lcd_buttons() == btnSELECT))
+        {      
+          clear = 1;
+          button_debounce_sm = 0;   
+
+          state = Joy;
+        }
+
+        if ((cursor_x3 == 10) && (read_lcd_buttons() == btnSELECT))
+        {
+          clear = 1;
+          button_debounce_sm = 0;   
+
+          state = btn_mode;
+        }
+        
+      }
+
+      if ((state == Control) && (clear == 1))
+      {
+        lcd.clear();
+        clear = 0;
+        break;
+      }
+      //break;
+   
+     case btn_mode: // --- Start Up --- //
+      if ((state == btn_mode) && (clear == 0))
+      {
+        btn_input();
+
+        if ((read_lcd_buttons() == btnSELECT))
+        {      
+          clear = 1;
+          button_debounce_sm = 0;   
+
+          state = Shield;
+        }
+      }
+
+      if ((state == btn_mode) && (clear == 1))
+      {
+        lcd.clear();
+        clear = 0;
+        break;
+      }
+      //break;    
+    
+     case Joy: // --- Start Up --- //
+      if ((state == Joy) && (clear == 0))
+      {
+        Joystick();
+
+        if ((read_lcd_buttons() == btnSELECT))
+        {      
+          clear = 1;
+          button_debounce_sm = 0;   
+
+          state = Shield;
+        }
+      }
+
+      if ((state == Joy) && (clear == 1))
+      {
+        lcd.clear();
+        clear = 0;
+        break;
+      }
+      //break;    
+    
+        
+    } // Switch Statement
+  } //Debounce IF statement
+}
+
+
+
+void setup() 
+{
+  lcd.begin(16,2);
+  lcd.display();
+
+  USART_Init();
+
+  //Timer1_CTC();
+  Timer2_CTC();
+
+}
+
+void loop() 
+{
+  state_machine();
+  //btn_input();
+
+}
+
+
